@@ -1,0 +1,327 @@
+#![cfg_attr(not(feature = "std"), no_std)]
+
+use frame_support::{
+    dispatch::DispatchResult,
+    ensure,
+    pallet_prelude::*,
+    traits::{Currency, ExistenceRequirement, ReservableCurrency},
+    PalletId,
+};
+use frame_system::pallet_prelude::*;
+use sp_runtime::traits::{AccountIdConversion, Saturating};
+use scale_info::TypeInfo;
+
+#[cfg(test)]
+mod tests;
+
+/// Configure the pallet by specifying the parameters and types on which it depends.
+#[frame_support::pallet]
+pub mod pallet {
+    use super::*;
+
+    #[pallet::config]
+    pub trait Config: frame_system::Config {
+        type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
+        type Currency: ReservableCurrency<Self::AccountId>;
+        type PalletId: Get<PalletId>;
+    }
+
+    #[pallet::pallet]
+    #[pallet::generate_store(pub(super) trait Store)]
+    pub struct Pallet<T>(_);
+
+    /// Policy duration in blocks (assuming 6 second block time)
+    const CLAIM_WINDOW: BlockNumber = 201_600; // 14 days in blocks
+    const MONTH_DURATION: BlockNumber = 432_000; // 30 days in blocks
+
+    #[derive(Clone, Encode, Decode, PartialEq, Eq, RuntimeDebug, TypeInfo)]
+    pub enum RiskCategory {
+        Theft,
+        Hacking,
+        AccidentalLoss,
+    }
+
+    #[derive(Clone, Encode, Decode, PartialEq, Eq, RuntimeDebug, TypeInfo)]
+    pub struct Policy<AccountId, BlockNumber> {
+        start_block: BlockNumber,
+        duration: u32,
+        max_coverage: BalanceOf<T>,
+        coverage_amount: BalanceOf<T>,
+        risk_category: RiskCategory,
+        policyholder: AccountId,
+        active: bool,
+        next_due_block: BlockNumber,
+        paid_months: u32,
+    }
+
+    #[pallet::storage]
+    #[pallet::getter(fn policy_count)]
+    pub type PolicyCount<T> = StorageValue<_, u64, ValueQuery>;
+
+    #[pallet::storage]
+    #[pallet::getter(fn policies)]
+    pub type Policies<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        u64,
+        Policy<T::AccountId, BlockNumberFor<T>>,
+    >;
+
+    #[pallet::storage]
+    pub type RiskMultipliers<T> = StorageMap<
+        _,
+        Blake2_128Concat,
+        RiskCategory,
+        Permill,
+        ValueQuery,
+    >;
+
+    #[pallet::storage]
+    pub type SuspiciousAccounts<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        T::AccountId,
+        bool,
+        ValueQuery,
+    >;
+
+    #[pallet::event]
+    #[pallet::generate_deposit(pub(super) fn deposit_event)]
+    pub enum Event<T: Config> {
+        PolicyCreated {
+            policy_id: u64,
+            policyholder: T::AccountId,
+            coverage_amount: BalanceOf<T>,
+            premium: BalanceOf<T>,
+        },
+        PremiumPaid {
+            policy_id: u64,
+            policyholder: T::AccountId,
+            amount: BalanceOf<T>,
+        },
+        ClaimProcessed {
+            policy_id: u64,
+            policyholder: T::AccountId,
+            amount: BalanceOf<T>,
+        },
+        PolicyCanceled {
+            policy_id: u64,
+            policyholder: T::AccountId,
+        },
+        AccountFlagged {
+            account: T::AccountId,
+            status: bool,
+        },
+    }
+
+    #[pallet::error]
+    pub enum Error<T> {
+        InvalidCoverageAmount,
+        InvalidDuration,
+        IncorrectPremium,
+        Unauthorized,
+        PolicyInactive,
+        ClaimWindowClosed,
+        PaymentOverdue,
+        PaymentNotDue,
+        PolicyCompleted,
+        SuspiciousAccount,
+    }
+
+    #[pallet::hooks]
+    impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {}
+
+    #[pallet::call]
+    impl<T: Config> Pallet<T> {
+        /// Create a new insurance policy with DOT payments
+        #[pallet::weight(10_000)]
+        pub fn create_policy(
+            origin: OriginFor<T>,
+            max_coverage: BalanceOf<T>,
+            duration_months: u32,
+            risk_category: RiskCategory,
+        ) -> DispatchResult {
+            let policyholder = ensure_signed(origin)?;
+            Self::perform_security_checks(&policyholder)?;
+
+            ensure!(max_coverage > Zero::zero(), Error::<T>::InvalidCoverageAmount);
+            ensure!(duration_months > 0, Error::<T>::InvalidDuration);
+
+            let coverage_amount = max_coverage / 100u32.into();
+            let premium = Self::calculate_premium(coverage_amount, &risk_category)?;
+
+            // Transfer DOT from policyholder to pallet account
+            let pallet_id = T::PalletId::get();
+            let pallet_account = pallet_id.into_account_truncating();
+            T::Currency::transfer(
+                &policyholder,
+                &pallet_account,
+                premium,
+                ExistenceRequirement::KeepAlive,
+            )?;
+
+            let current_block = frame_system::Pallet::<T>::block_number();
+            let policy_id = Self::policy_count();
+
+            let policy = Policy {
+                start_block: current_block,
+                duration: duration_months,
+                max_coverage,
+                coverage_amount,
+                risk_category,
+                policyholder: policyholder.clone(),
+                active: true,
+                next_due_block: current_block + MONTH_DURATION,
+                paid_months: 1,
+            };
+
+            PolicyCount::<T>::put(policy_id + 1);
+            Policies::<T>::insert(policy_id, policy);
+
+            Self::deposit_event(Event::PolicyCreated {
+                policy_id,
+                policyholder,
+                coverage_amount,
+                premium,
+            });
+
+            Ok(())
+        }
+
+        /// Process insurance claim with security checks
+        #[pallet::weight(10_000)]
+        pub fn process_claim(
+            origin: OriginFor<T>,
+            policy_id: u64,
+        ) -> DispatchResult {
+            let claimant = ensure_signed(origin)?;
+            Self::perform_security_checks(&claimant)?;
+
+            let mut policy = Policies::<T>::get(policy_id).ok_or(Error::<T>::Unauthorized)?;
+            ensure!(policy.policyholder == claimant, Error::<T>::Unauthorized);
+            ensure!(policy.active, Error::<T>::PolicyInactive);
+
+            let current_block = frame_system::Pallet::<T>::block_number();
+            ensure!(
+                current_block <= policy.start_block + CLAIM_WINDOW,
+                Error::<T>::ClaimWindowClosed
+            );
+            ensure!(
+                current_block <= policy.next_due_block,
+                Error::<T>::PaymentOverdue
+            );
+
+            // Transfer DOT from pallet account to claimant
+            let pallet_id = T::PalletId::get();
+            let pallet_account = pallet_id.into_account_truncating();
+            T::Currency::transfer(
+                &pallet_account,
+                &claimant,
+                policy.coverage_amount,
+                ExistenceRequirement::AllowDeath,
+            )?;
+
+            policy.active = false;
+            Policies::<T>::insert(policy_id, policy);
+
+            Self::deposit_event(Event::ClaimProcessed {
+                policy_id,
+                policyholder: claimant,
+                amount: policy.coverage_amount,
+            });
+
+            Ok(())
+        }
+
+        /// Pay monthly premium in DOT
+        #[pallet::weight(10_000)]
+        pub fn pay_premium(
+            origin: OriginFor<T>,
+            policy_id: u64,
+        ) -> DispatchResult {
+            let payer = ensure_signed(origin)?;
+            Self::perform_security_checks(&payer)?;
+
+            let mut policy = Policies::<T>::get(policy_id).ok_or(Error::<T>::Unauthorized)?;
+            ensure!(policy.policyholder == payer, Error::<T>::Unauthorized);
+            ensure!(policy.active, Error::<T>::PolicyInactive);
+
+            let current_block = frame_system::Pallet::<T>::block_number();
+            ensure!(current_block >= policy.next_due_block, Error::<T>::PaymentNotDue);
+            ensure!(policy.paid_months < policy.duration, Error::<T>::PolicyCompleted);
+
+            let premium = Self::calculate_premium(policy.coverage_amount, &policy.risk_category)?;
+
+            // Transfer DOT premium payment
+            let pallet_id = T::PalletId::get();
+            let pallet_account = pallet_id.into_account_truncating();
+            T::Currency::transfer(
+                &payer,
+                &pallet_account,
+                premium,
+                ExistenceRequirement::KeepAlive,
+            )?;
+
+            policy.next_due_block = policy.next_due_block.saturating_add(MONTH_DURATION);
+            policy.paid_months += 1;
+
+            if policy.paid_months == policy.duration {
+                policy.active = false;
+            }
+
+            Policies::<T>::insert(policy_id, policy);
+            Self::deposit_event(Event::PremiumPaid {
+                policy_id,
+                policyholder: payer,
+                amount: premium,
+            });
+
+            Ok(())
+        }
+
+        /// Admin function to flag suspicious accounts
+        #[pallet::weight(10_000)]
+        pub fn flag_account(
+            origin: OriginFor<T>,
+            account: T::AccountId,
+            status: bool,
+        ) -> DispatchResult {
+            ensure_root(origin)?;
+            SuspiciousAccounts::<T>::insert(&account, status);
+            Self::deposit_event(Event::AccountFlagged { account, status });
+            Ok(())
+        }
+    }
+
+    impl<T: Config> Pallet<T> {
+        /// Perform security checks before policy operations
+        fn perform_security_checks(account: &T::AccountId) -> DispatchResult {
+            ensure!(
+                !SuspiciousAccounts::<T>::contains_key(account),
+                Error::<T>::SuspiciousAccount
+            );
+            
+            // Additional security checks can be added here
+            Ok(())
+        }
+
+        /// Calculate premium based on risk multipliers
+        fn calculate_premium(
+            coverage_amount: BalanceOf<T>,
+            risk_category: &RiskCategory,
+        ) -> Result<BalanceOf<T>, DispatchError> {
+            let multiplier = RiskMultipliers::<T>::get(risk_category);
+            Ok(multiplier.mul_ceil(coverage_amount))
+        }
+    }
+
+    impl<T: Config> Default for RiskMultipliers<T> {
+        fn default() -> sp_std::collections::btree_map::BTreeMap<RiskCategory, Permill> {
+            let mut map = sp_std::collections::btree_map::BTreeMap::new();
+            map.insert(RiskCategory::Theft, Permill::from_percent(2));
+            map.insert(RiskCategory::Hacking, Permill::from_percent(3));
+            map.insert(RiskCategory::AccidentalLoss, Permill::from_percent(1));
+            map
+        }
+    }
+}
